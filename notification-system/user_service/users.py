@@ -137,4 +137,77 @@ async def create_user(payload: UserCreateRequest, db: AsyncSession = Depends(get
     await db.refresh(user)
     logger.info(f"User created: {user.id}")
     return BaseResponse.ok(_user_to_response(user), message="User created successfully")
-    
+
+
+@router.post("/login", response_model=BaseResponse[TokenResponse])
+async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+    """Authenticate user and return JWT."""
+    result = await db.execute(select(User).where(User.email == payload.email))
+    user = result.scalar_one_or_none()
+    if not user or not _verify_password(payload.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = _create_token(str(user.id), user.email)
+    return BaseResponse.ok(TokenResponse(access_token=token), message="Login successful")
+
+
+@router.get("/{user_id}", response_model=BaseResponse[UserResponse])
+async def get_user(user_id: str, db: AsyncSession = Depends(get_db)):
+    """Get user by ID. Cached in Redis for 5 minutes."""
+    cache_key = f"user:{user_id}"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return BaseResponse.ok(UserResponse(**json.loads(cached)), message="User found (cached)")
+
+    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    resp = _user_to_response(user)
+    await redis_client.set(cache_key, resp.model_dump_json(), ttl=300)
+    return BaseResponse.ok(resp, message="User found")
+
+@router.get("/", response_model=BaseResponse[list[UserResponse]])
+async def list_users(page: int = 1, limit: int = 20, db: AsyncSession = Depends(get_db)):
+    """List all users with pagination."""
+    offset = (page - 1) * limit
+    result = await db.execute(select(User).offset(offset).limit(limit))
+    users = result.scalars().all()
+    count_result = await db.execute(select(User))
+    total = len(count_result.scalars().all())
+    return BaseResponse.paginated([_user_to_response(u) for u in users], total, page, limit)
+
+
+@router.patch("/{user_id}", response_model=BaseResponse[UserResponse])
+async def update_user(user_id: str, payload: UserUpdateRequest, db: AsyncSession = Depends(get_db)):
+    """Update user push token or preferences."""
+    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if payload.name is not None:
+        user.name = payload.name
+    if payload.push_token is not None:
+        user.push_token = payload.push_token
+    if payload.preferences is not None:
+        user.preferences = payload.preferences.model_dump()
+
+    await db.commit()
+    await db.refresh(user)
+    await redis_client.delete(f"user:{user_id}")
+    return BaseResponse.ok(_user_to_response(user), message="User updated")
+
+
+@router.delete("/{user_id}", response_model=BaseResponse[None])
+async def delete_user(user_id: str, db: AsyncSession = Depends(get_db)):
+    """Soft-delete a user."""
+    result = await db.execute(select(User).where(User.id == uuid.UUID(user_id)))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.is_active = False
+    await db.commit()
+    await redis_client.delete(f"user:{user_id}")
+    return BaseResponse.ok(None, message="User deactivated")
