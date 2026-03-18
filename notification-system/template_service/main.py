@@ -1,0 +1,51 @@
+"""Template Service - stores, versions, and renders notificaiton templates."""
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.core.database import create_tables
+from app.core.redis_client import redis_client
+from app.api.v1.router import api_router
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app:FastAPI):
+    logger.info("Starting Template Service...")
+    await create_tables()
+    await redis_client.connect()
+    logger.info("Template Service started.")
+    yield 
+    await redis_client.disconnect()
+
+app = FastAPI(
+    title="Notification System - Template Service",
+    description="Stores notification templates, handles variable substitution and versioning.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.exception_handler(Exception)
+async def global_excpetion_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"success": False, "error": str(exc), "message": "internal server error",
+                    "data": None, "meta": {"total": 0, "limit": 0, "page": 1, "total_pages": 0,
+                                            "has_next": False, "has_previous": False}},
+    )
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    redis_ok = await redis_client.ping()
+    return {
+        "service": "template-service",
+        "status": "healthy" if redis_ok else "degraded",
+        "checks": {"redis": "up" if redis_ok else "down"},
+    }
